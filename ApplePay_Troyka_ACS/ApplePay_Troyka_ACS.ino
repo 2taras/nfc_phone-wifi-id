@@ -1,5 +1,3 @@
-//Access Control Reader based on ApplePay (EMV) and Troyka cards
-
 
 #include <WiFi.h>
 #include <esp_wifi.h>
@@ -8,16 +6,18 @@ uint8_t newMACAddress[] = {0x32, 0xAE, 0xA4, 0x07, 0x0D, 0x66};
 #include <string>
 #include <HTTPClient.h>
 #include <Adafruit_PN532.h>
-const char* ssid = "SEPIFANSE";
-const char* password = "89262027736";
+#include "FS.h"
+#include "SPIFFS.h"
 String sosi;
+unsigned long previousMillis = 0;
+
+const long interval = 60000;
 
 // If using the breakout with SPI, define the pins for SPI communication.
 #define PN532_SCK  (17)
 #define PN532_MOSI (18)
 #define PN532_SS   (19)
 #define PN532_MISO (5)
-
 // Use this line for a breakout with a software SPI connection (recommended):
 Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 
@@ -26,15 +26,46 @@ Adafruit_PN532 nfc(PN532_SCK, PN532_MISO, PN532_MOSI, PN532_SS);
 static const uint8_t aid_marker[] = {0x4F, 0x07};
 static const uint8_t pan_marker[] = {0x5A, 0x08};
 
+String readFile(fs::FS &fs, const char * path) {
+  Serial.printf("Reading file: %s\r\n", path);
+
+  File file = fs.open(path);
+  if (!file || file.isDirectory()) {
+    Serial.println("- failed to open file for reading");
+    return "";
+  }
+
+  Serial.println("- read from file:");
+  if (file.available()) {
+    return file.readString();
+  }
+}
+
+void writeFile(fs::FS &fs, const char * path, const char * message) {
+  Serial.printf("Writing file: %s\r\n", path);
+
+  File file = fs.open(path, FILE_WRITE);
+  if (!file) {
+    Serial.println("- failed to open file for writing");
+    return;
+  }
+  if (file.print(message)) {
+    Serial.println("- file written");
+  } else {
+    Serial.println("- frite failed");
+  }
+}
 
 
 void setup(void) {
+  pinMode(14, OUTPUT);
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS Mount Failed");
+    return;
+  }
   Serial.begin(115200);
   Serial.println("Hello!");
   WiFi.mode(WIFI_STA);
-  IPAddress ip(192, 168, 1, 167); //статический IP
-  IPAddress gateway(192, 168, 1, 1);
-  IPAddress subnet(255, 255, 255, 0);
   WiFi.begin("SEPIFANSE", "89262027736");
   Serial.println(WiFi.macAddress());
   while (WiFi.status() != WL_CONNECTED) {
@@ -136,6 +167,37 @@ char * gettroykaserial(uint8_t * blockdata)
 
 
 void loop(void) {
+  unsigned long currentMillis = millis();
+  if (currentMillis - previousMillis >= interval) {
+    previousMillis = currentMillis;
+    while (WiFi.status() != WL_CONNECTED) {
+      delay(1000);
+      Serial.println("Connecting to WiFi..");
+    }
+    HTTPClient http;
+    String payload;
+    String ides = "https://548b.ru/card_id.txt";
+    http.begin(ides); //Specify the URL
+    int httpCode = http.GET();                                        //Make the request
+
+    if (httpCode > 0) { //Check for the returning code
+
+      payload = http.getString();
+      if (payload == "") {
+        payload = "1";
+      }
+      Serial.println(httpCode);
+      Serial.println(payload);
+    }
+
+    else {
+      Serial.println("Error on HTTP request");
+    }
+
+    http.end(); //Free the resourc
+    writeFile(SPIFFS, "/iday.txt", payload.c_str());
+    Serial.println(readFile(SPIFFS, "/iday.txt"));
+  }
   uint8_t success;
   uint8_t uid[] = { 0, 0, 0, 0, 0, 0, 0 };  // Buffer to store the returned UID
   uint8_t uidLength;                        // Length of the UID (4 or 7 bytes depending on ISO14443A card type)
@@ -198,44 +260,52 @@ void loop(void) {
           Serial.println("-----------------------");
           Serial.print("Card ID: ");
           Serial.println(cardID);
-          while (WiFi.status() != WL_CONNECTED) {
-            delay(1000);
-            Serial.println("Connecting to WiFi..");
-          }
-          if ((WiFi.status() == WL_CONNECTED)) { //Check the current connection status
-
-            HTTPClient http;
-            String cardId = "https://548b.ru/kassa/notify.php?id=" + sosi;
-            Serial.println(cardId);
-            http.begin(cardId); //Specify the URL
-            int httpCode = http.GET();                                        //Make the request
-
-            if (httpCode > 0) { //Check for the returning code
-
-              String payload = http.getString();
-              Serial.println(httpCode);
-              Serial.println(payload);
+          if (0 <= readFile(SPIFFS, "/iday.txt").indexOf(sosi)) {
+            Serial.println("open");
+            digitalWrite(14, HIGH);
+            delay(500);
+            digitalWrite(14, LOW);
+          } else {
+            Serial.println(readFile(SPIFFS, "/iday.txt").indexOf(sosi));
+            Serial.println(readFile(SPIFFS, "/iday.txt"));
+            while (WiFi.status() != WL_CONNECTED) {
+              delay(1000);
+              Serial.println("Connecting to WiFi..");
             }
+            if ((WiFi.status() == WL_CONNECTED)) { //Check the current connection status
 
-            else {
-              Serial.println("Error on HTTP request");
-            }
+              HTTPClient http;
+              String cardId = "https://548b.ru/kassa/notify.php?id=" + sosi;
+              Serial.println(cardId);
+              http.begin(cardId); //Specify the URL
+              int httpCode = http.GET();                                        //Make the request
 
-            http.end(); //Free the resources
+              if (httpCode > 0) { //Check for the returning code
 
-            delay(2000);
-          } // end of if (success)
+                String payload = http.getString();
+                Serial.println(httpCode);
+                Serial.println(payload);
+              }
 
-          else
-          {
-            // If authentication failed, probably it's not mifare card
-            // tryes to check for EMV card
-            Serial.println("Failed to authenticate card as Mifare. Try to check for EMV card");
+              else {
+                Serial.println("Error on HTTP request");
+              }
 
-            delay(2000);
+              http.end(); //Free the resources
+
+              delay(2000);
+            } // end of if (success)
           }
-        } // end of if (uidLength == 7)
-      }
+        }
+        else
+        {
+          // If authentication failed, probably it's not mifare card
+          // tryes to check for EMV card
+          Serial.println("Failed to authenticate card as Mifare. Try to check for EMV card");
+
+          delay(2000);
+        }
+      } // end of if (uidLength == 7)
       else if (uidLength == 4)
       {
         // If 4 bytes UID, we probably have a EMV card
@@ -314,28 +384,35 @@ void loop(void) {
               cardid = cardid + temp;
               Serial.print(temp);
             }
-            while (WiFi.status() != WL_CONNECTED) {
-              delay(1000);
-              Serial.println("Connecting to WiFi..");
+            if (0 <= readFile(SPIFFS, "/iday.txt").indexOf(cardid)) {
+              Serial.println("open");
+              digitalWrite(14, HIGH);
+              delay(500);
+              digitalWrite(14, LOW);
+            } else {
+              while (WiFi.status() != WL_CONNECTED) {
+                delay(1000);
+                Serial.println("Connecting to WiFi..");
+              }
+              HTTPClient http;
+              cardid = "https://548b.ru/kassa/notify.php?id=" + cardid;
+              Serial.println(cardid);
+              http.begin(cardid); //Specify the URL
+              int httpCode = http.GET();                                        //Make the request
+
+              if (httpCode > 0) { //Check for the returning code
+
+                String payload = http.getString();
+                Serial.println(httpCode);
+                Serial.println(payload);
+              }
+
+              else {
+                Serial.println("Error on HTTP request");
+              }
+
+              http.end(); //Free the resourc
             }
-            HTTPClient http;
-            cardid = "https://548b.ru/kassa/notify.php?id=" + cardid;
-            Serial.println(cardid);
-            http.begin(cardid); //Specify the URL
-            int httpCode = http.GET();                                        //Make the request
-
-            if (httpCode > 0) { //Check for the returning code
-
-              String payload = http.getString();
-              Serial.println(httpCode);
-              Serial.println(payload);
-            }
-
-            else {
-              Serial.println("Error on HTTP request");
-            }
-
-            http.end(); //Free the resourc
           }
 
 
